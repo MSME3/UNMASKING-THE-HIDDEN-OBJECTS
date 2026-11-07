@@ -1,0 +1,141 @@
+"""
+Configuration and Path definitions for Jetson Nano AI Vision Search.
+"""
+import os
+import re
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Directory Paths
+# ---------------------------------------------------------------------------
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(BACKEND_DIR)
+
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+TEMPLATES_DIR = os.path.join(FRONTEND_DIR, "templates")
+STATIC_DIR = os.path.join(FRONTEND_DIR, "static")
+
+DATASET_DIR = os.path.join(BASE_DIR, "dataset")
+INDEX_DIR = os.path.join(BASE_DIR, "index_store")
+CLOUD_DIR = os.path.join(BASE_DIR, "cloud_storage")
+CLIPS_DIR = os.path.join(CLOUD_DIR, "clips")
+FRAMES_DIR = os.path.join(CLOUD_DIR, "frames")
+QUERY_DIR = os.path.join(BASE_DIR, "queries")
+
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+VIDEO_BUFFER_DIR = os.path.join(BASE_DIR, "video_buffer")
+TEMP_RECORDINGS_DIR = VIDEO_BUFFER_DIR
+TEMP_DOWNLOADS_DIR = os.path.join(CACHE_DIR, "downloads")
+
+# Google Drive / Cloud Sync Directory for Live 5-minute recordings
+# If GDRIVE_DIR or DRIVE_RECORDINGS_DIR is set, saves 5-min recordings directly to Drive
+GDRIVE_DIR = os.environ.get("GDRIVE_DIR") or os.environ.get("DRIVE_RECORDINGS_DIR") or ""
+if GDRIVE_DIR and os.path.exists(GDRIVE_DIR):
+    LIVE_RECORDINGS_DIR = os.path.abspath(GDRIVE_DIR)
+else:
+    LIVE_RECORDINGS_DIR = VIDEO_BUFFER_DIR
+
+# Local offline model caches
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+INSIGHTFACE_ROOT = os.path.join(MODELS_DIR, "insightface")
+TORCH_HOME = os.path.join(MODELS_DIR, "torch")
+os.environ["TORCH_HOME"] = TORCH_HOME
+
+DB_PATH = os.path.join(BASE_DIR, "detections.db")
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "yolov8n.pt")
+
+# Ensure all runtime directories exist
+for _d in (
+    DATASET_DIR,
+    INDEX_DIR,
+    CLOUD_DIR,
+    CLIPS_DIR,
+    FRAMES_DIR,
+    QUERY_DIR,
+    VIDEO_BUFFER_DIR,
+    LIVE_RECORDINGS_DIR,
+    CACHE_DIR,
+    TEMP_RECORDINGS_DIR,
+    TEMP_DOWNLOADS_DIR,
+    TEMPLATES_DIR,
+    STATIC_DIR,
+    MODELS_DIR,
+    INSIGHTFACE_ROOT,
+    TORCH_HOME,
+):
+    os.makedirs(_d, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Detection & Matching Defaults
+# ---------------------------------------------------------------------------
+# Full COCO Vehicle classes: bicycle(1), car(2), motorcycle(3), bus(5), truck(7)
+VEHICLE_YOLO_CLASSES = {
+    1: "bicycle",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+}
+
+FOUR_WHEEL_TYPES = {"car", "bus", "truck"}
+TWO_WHEEL_TYPES = {"motorcycle", "bicycle"}
+
+
+def is_compatible_target_type(type1: str, type2: str) -> bool:
+    """
+    Evaluates whether two target types can be compared:
+    - Same types (e.g. person == person, car == car)
+    - 4-wheel cross-matching (e.g. car, SUV, truck, bus)
+    - 2-wheel cross-matching (e.g. motorcycle, bicycle)
+    """
+    if type1 == type2:
+        return True
+    if type1 in FOUR_WHEEL_TYPES and type2 in FOUR_WHEEL_TYPES:
+        return True
+    if type1 in TWO_WHEEL_TYPES and type2 in TWO_WHEEL_TYPES:
+        return True
+    return False
+
+
+FACE_THRESHOLD = 0.45
+VEHICLE_THRESHOLD = 0.58             # Calibrated target vehicle visual similarity threshold
+VEHICLE_COLOR_THRESHOLD = 0.45       # Minimum 3D HSV color similarity to prevent cross-color false matches
+VEHICLE_THRESHOLD = 0.48             # Calibrated target vehicle visual similarity threshold
+VEHICLE_COLOR_THRESHOLD = 0.42       # Minimum 3D HSV color similarity to prevent cross-color false matches
+VEHICLE_PLATE_PROMOTION_THRESHOLD = 0.45  # Relaxed visual threshold when license plate is 100% verified
+VEHICLE_CONF_MIN = 0.25
+TOP_K = 2000
+
+LIVE_MATCH_COOLDOWN_SEC = 8          # Prevent saving duplicate matches every single frame
+LIVE_QUERY_TTL_SEC = 600             # Stop live-watching a query after 10 min
+LIVE_CLIP_SECONDS = 5                # Length of auto-saved live clip (ring buffer)
+CAMERA_START_TIMEOUT_SEC = 4         # Wait timeout for camera initialization
+RECORDING_SEGMENT_SECONDS = 300      # 5 minutes per continuous segment
+LIVE_AI_INTERVAL_SEC = 0.40          # Balanced AI inference rate for smooth Jetson execution
+INDEX_SAMPLES_PER_SEC = 1            # 1 frame/sec for background indexing (prevents CPU lockup)
+
+# Optional License Plate Verification for Vehicles
+ENABLE_LPR = True                    # Can be overridden via CLI --disable-lpr
+LPR_SIMILARITY_THRESHOLD = 0.85      # Minimum character similarity to verify plate
+
+# Regex to extract YYYYMMDD_HHMMSS from video filenames
+_FILENAME_TS_RE = re.compile(r"(\d{8})_(\d{6})")
+
+
+def get_video_start_time(video_path):
+    """
+    Recovers the real-world wall-clock start time of a video.
+    1) Looks for YYYYMMDD_HHMMSS pattern anywhere in the filename.
+    2) Falls back to the file's modification time if no pattern found.
+    """
+    fname = os.path.basename(video_path)
+    m = _FILENAME_TS_RE.search(fname)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(video_path))
+    except OSError:
+        return datetime.now()

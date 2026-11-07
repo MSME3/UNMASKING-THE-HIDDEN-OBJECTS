@@ -1,0 +1,927 @@
+"""
+Google Drive Storage Integration Module for Jetson Nano AI Vision Search.
+
+Provides hierarchical date/hour folder management, non-blocking asynchronous uploads,
+verification, and on-demand temporary downloads for historical query matching.
+"""
+import os
+import time
+import json
+import threading
+import requests
+from datetime import datetime
+
+try:
+    import jwt
+    import cryptography
+    _JWT_AVAILABLE = True
+except ImportError:
+    _JWT_AVAILABLE = False
+
+
+class GoogleDriveStorage:
+    """
+    Handles authentication, hierarchical folder navigation/creation,
+    resumable/multipart uploads, and streaming downloads with Google Drive v3 REST API.
+    """
+
+    OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+    DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+    DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
+    SCOPES = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+
+    def __init__(self, service_account_path=None, root_folder_id=None):
+        self.service_account_path = (
+            service_account_path
+            or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
+        )
+        self.root_folder_id = root_folder_id or os.environ.get("GDRIVE_ROOT_FOLDER_ID") or "root"
+        self.access_token = os.environ.get("GDRIVE_ACCESS_TOKEN")
+        self.refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN")
+        self.client_id = os.environ.get("GDRIVE_CLIENT_ID")
+        self.client_secret = os.environ.get("GDRIVE_CLIENT_SECRET")
+        self.token_file_path = os.environ.get("GDRIVE_TOKEN_JSON")
+        
+        self.token_expiry = 0
+        self.folder_cache = {}  # Cache: path_tuple -> folder_id
+        self._lock = threading.Lock()
+
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if not self.token_file_path:
+            cand_token = os.path.join(base_dir, "token.json")
+            if os.path.exists(cand_token):
+                self.token_file_path = cand_token
+
+        # Check for service account / OAuth credentials file in standard locations
+        if not self.service_account_path:
+            for candidate in ("service_account.json", "credentials.json", "gdrive_credentials.json"):
+                cand_path = os.path.join(base_dir, candidate)
+                if os.path.exists(cand_path):
+                    self.service_account_path = cand_path
+                    break
+
+        # Check if the file is an OAuth Client credentials file
+        if self.service_account_path and os.path.exists(self.service_account_path):
+            try:
+                with open(self.service_account_path, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                client_info = cdata.get("installed") or cdata.get("web")
+                if client_info:
+                    self.client_id = self.client_id or client_info.get("client_id")
+                    self.client_secret = self.client_secret or client_info.get("client_secret")
+            except Exception as e:
+                print(f"[gdrive] Warning inspecting credentials file: {e}")
+
+        # Load token from token.json if present
+        if self.token_file_path and os.path.exists(self.token_file_path):
+            try:
+                with open(self.token_file_path, "r", encoding="utf-8") as f:
+                    tdata = json.load(f)
+                self.access_token = self.access_token or tdata.get("access_token")
+                self.refresh_token = self.refresh_token or tdata.get("refresh_token")
+                self.token_expiry = tdata.get("expiry", 0)
+                if not self.client_id:
+                    self.client_id = tdata.get("client_id")
+                if not self.client_secret:
+                    self.client_secret = tdata.get("client_secret")
+            except Exception as e:
+                print(f"[gdrive] Warning reading token.json: {e}")
+
+    def is_configured(self):
+        """Returns True if valid Google Drive credentials or access tokens are available."""
+        # 1. OAuth with refresh token
+        if self.refresh_token and self.client_id and self.client_secret:
+            return True
+        if self.access_token:
+            return True
+        # 2. Service Account JSON file
+        if self.service_account_path and os.path.exists(self.service_account_path):
+            try:
+                with open(self.service_account_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if d.get("type") == "service_account":
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _get_auth_headers(self):
+        """Returns HTTP Authorization headers with a valid, refreshed access token."""
+        token = self._get_access_token()
+        if not token:
+            raise RuntimeError("Google Drive credentials not configured or token generation failed.")
+        return {
+            "Authorization": f"Bearer {token}",
+        }
+
+    def _get_access_token(self):
+        """Refreshes or generates access token using Service Account JWT or OAuth2 refresh flow."""
+        with self._lock:
+            now = time.time()
+            if self.access_token and now < (self.token_expiry - 60):
+                return self.access_token
+
+            # Option 1: Service Account JSON with JWT
+            if self.service_account_path and os.path.exists(self.service_account_path) and _JWT_AVAILABLE:
+                try:
+                    with open(self.service_account_path, "r", encoding="utf-8") as f:
+                        sa_data = json.load(f)
+                    
+                    if sa_data.get("type") == "service_account":
+                        private_key = sa_data.get("private_key")
+                        client_email = sa_data.get("client_email")
+                        token_uri = sa_data.get("token_uri", self.OAUTH_TOKEN_URL)
+
+                        if private_key and client_email:
+                            payload = {
+                                "iss": client_email,
+                                "scope": " ".join(self.SCOPES),
+                                "aud": token_uri,
+                                "exp": int(now + 3600),
+                                "iat": int(now),
+                            }
+                            signed_jwt = jwt.encode(payload, private_key, algorithm="RS256")
+                            
+                            resp = requests.post(
+                                token_uri,
+                                data={
+                                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                                    "assertion": signed_jwt,
+                                },
+                                timeout=15,
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                self.access_token = data.get("access_token")
+                                self.token_expiry = now + data.get("expires_in", 3600)
+                                return self.access_token
+                            else:
+                                print(f"[gdrive] Service Account token exchange failed: {resp.status_code} {resp.text}")
+                except Exception as e:
+                    print(f"[gdrive] Error generating Service Account token: {e}")
+
+            # Option 2: OAuth2 Refresh Token (from credentials.json / token.json)
+            if self.refresh_token and self.client_id and self.client_secret:
+                try:
+                    resp = requests.post(
+                        self.OAUTH_TOKEN_URL,
+                        data={
+                            "client_id": self.client_id,
+                            "client_secret": self.client_secret,
+                            "refresh_token": self.refresh_token,
+                            "grant_type": "refresh_token",
+                        },
+                        timeout=15,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        self.access_token = data.get("access_token")
+                        self.token_expiry = now + data.get("expires_in", 3600)
+                        # Save updated access token into token.json
+                        if self.token_file_path:
+                            try:
+                                tdata = {}
+                                if os.path.exists(self.token_file_path):
+                                    with open(self.token_file_path, "r", encoding="utf-8") as tf:
+                                        tdata = json.load(tf)
+                                tdata["access_token"] = self.access_token
+                                tdata["expiry"] = self.token_expiry
+                                tdata["refresh_token"] = self.refresh_token
+                                tdata["client_id"] = self.client_id
+                                tdata["client_secret"] = self.client_secret
+                                with open(self.token_file_path, "w", encoding="utf-8") as tf:
+                                    json.dump(tdata, tf, indent=2)
+                            except Exception:
+                                pass
+                        return self.access_token
+                    else:
+                        print(f"[gdrive] OAuth2 refresh failed: {resp.status_code} {resp.text}")
+                except Exception as e:
+                    print(f"[gdrive] Error refreshing OAuth token: {e}")
+
+            return self.access_token
+
+    def get_or_create_folder(self, folder_name, parent_id="root"):
+        """
+        Finds an existing folder by name under parent_id, or creates it if not found.
+        Uses in-memory cache to minimize API round trips.
+        """
+        cache_key = (parent_id, folder_name)
+        if cache_key in self.folder_cache:
+            return self.folder_cache[cache_key]
+
+        headers = self._get_auth_headers()
+        # Query for existing folder
+        query = (
+            f"name = '{folder_name}' and "
+            f"'{parent_id}' in parents and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            f"trashed = false"
+        )
+        url = f"{self.DRIVE_API_BASE}/files"
+        params = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "files(id, name)",
+        }
+        
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        if resp.status_code == 200:
+            files = resp.json().get("files", [])
+            if files:
+                folder_id = files[0]["id"]
+                self.folder_cache[cache_key] = folder_id
+                return folder_id
+
+        # Not found: Create folder
+        metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id] if parent_id else [],
+        }
+        create_resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=metadata, timeout=15)
+        if create_resp.status_code in (200, 201):
+            folder_id = create_resp.json().get("id")
+            self.folder_cache[cache_key] = folder_id
+            return folder_id
+        else:
+            raise RuntimeError(f"Failed to create Google Drive folder '{folder_name}': {create_resp.status_code} {create_resp.text}")
+
+    def get_or_create_folder_hierarchy(self, dt=None):
+        """
+        Navigates or creates the required hierarchy:
+        Google Drive / YEAR / MONTH / DATE / HOUR
+        Example: 2026 / 09 / 21 / 14
+        
+        Returns:
+            (target_folder_id, hierarchy_path_str)
+        """
+        dt = dt or datetime.now()
+        year_str = dt.strftime("%Y")
+        month_str = dt.strftime("%m")
+        date_str = dt.strftime("%d")
+        hour_str = dt.strftime("%H")
+
+        current_parent = self.root_folder_id or "root"
+        for seg in (year_str, month_str, date_str, hour_str):
+            current_parent = self.get_or_create_folder(seg, parent_id=current_parent)
+
+        hierarchy_path = f"{year_str}/{month_str}/{date_str}/{hour_str}"
+        return current_parent, hierarchy_path
+
+    def get_or_create_subfolder(self, folder_name, parent_id=None):
+        """Finds or creates a top-level or subfolder in Google Drive (e.g. 'frames', 'clips')."""
+        parent = parent_id or self.root_folder_id or "root"
+        return self.get_or_create_folder(folder_name, parent_id=parent)
+
+    def upload_file(self, local_path, parent_folder_id=None, target_filename=None, mime_type=None):
+        """
+        Uploads a local video/image/file to the specified parent folder on Google Drive.
+        Performs verification that the file was created and returns file info.
+        
+        Returns:
+            (file_id, drive_file_name, web_view_link)
+        """
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Local file does not exist: {local_path}")
+
+        file_size = os.path.getsize(local_path)
+        filename = target_filename or os.path.basename(local_path)
+        if not mime_type:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in (".jpg", ".jpeg"):
+                mime_type = "image/jpeg"
+            elif ext == ".png":
+                mime_type = "image/png"
+            elif ext in (".mp4", ".avi", ".mkv", ".mov"):
+                mime_type = "video/mp4"
+            else:
+                mime_type = "application/octet-stream"
+
+        headers = self._get_auth_headers()
+        parent_id = parent_folder_id or self.root_folder_id or "root"
+
+        # Resumable upload for files > 2MB, simple multipart for smaller files
+        if file_size > 2 * 1024 * 1024:
+            init_url = f"{self.DRIVE_UPLOAD_BASE}/files?uploadType=resumable"
+            metadata = {
+                "name": filename,
+                "parents": [parent_id] if parent_id and parent_id != "root" else [],
+            }
+            init_headers = {
+                **headers,
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": mime_type,
+                "X-Upload-Content-Length": str(file_size),
+            }
+
+            init_resp = requests.post(init_url, headers=init_headers, json=metadata, timeout=20)
+            if init_resp.status_code not in (200, 201):
+                raise RuntimeError(f"Failed to initiate Google Drive upload session: {init_resp.status_code} {init_resp.text}")
+
+            upload_url = init_resp.headers.get("Location")
+            if not upload_url:
+                raise RuntimeError("Google Drive did not return a resumable upload Location URL.")
+
+            chunk_size = 8 * 1024 * 1024  # 8MB chunk (multiple of 256KB)
+            offset = 0
+            with open(local_path, "rb") as f:
+                while offset < file_size:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    chunk_len = len(chunk)
+                    end_byte = offset + chunk_len - 1
+                    upload_headers = {
+                        "Content-Length": str(chunk_len),
+                        "Content-Range": f"bytes {offset}-{end_byte}/{file_size}",
+                        "Content-Type": mime_type,
+                    }
+                    
+                    # Upload chunk with retries
+                    success = False
+                    for attempt in range(3):
+                        try:
+                            upload_resp = requests.put(upload_url, headers=upload_headers, data=chunk, timeout=60)
+                            if upload_resp.status_code in (200, 201):
+                                res_data = upload_resp.json()
+                                return res_data.get("id"), filename, res_data.get("webViewLink", "")
+                            elif upload_resp.status_code == 308:
+                                # Chunk accepted, continue to next
+                                offset += chunk_len
+                                success = True
+                                time.sleep(0.02)  # Rate-pacing yield to prevent network socket starvation for web streaming
+                                break
+                            else:
+                                time.sleep(1.0)
+                        except Exception as chunk_err:
+                            if attempt == 2:
+                                raise chunk_err
+                            time.sleep(1.0)
+                    if not success and upload_resp.status_code not in (200, 201, 308):
+                        raise RuntimeError(f"Failed uploading file chunk to Google Drive: {upload_resp.status_code} {upload_resp.text}")
+
+            if upload_resp and upload_resp.status_code in (200, 201):
+                res_data = upload_resp.json()
+                return res_data.get("id"), filename, res_data.get("webViewLink", "")
+            else:
+                raise RuntimeError("Upload ended without receiving file metadata confirmation.")
+        else:
+            # Multipart upload for fast small image / clip uploads
+            metadata = {
+                "name": filename,
+                "parents": [parent_id] if parent_id and parent_id != "root" else [],
+            }
+            files = {
+                "data": ("metadata", json.dumps(metadata), "application/json; charset=UTF-8"),
+                "file": (filename, open(local_path, "rb"), mime_type),
+            }
+            upload_url = f"{self.DRIVE_UPLOAD_BASE}/files?uploadType=multipart"
+            resp = requests.post(upload_url, headers=headers, files=files, timeout=30)
+            if resp.status_code in (200, 201):
+                res_data = resp.json()
+                return res_data.get("id"), filename, res_data.get("webViewLink", "")
+            else:
+                raise RuntimeError(f"Failed multipart upload to Google Drive: {resp.status_code} {resp.text}")
+
+    def upload_media_and_cleanup(self, local_path, folder_name="frames"):
+        """
+        Uploads an image or clip to Google Drive folder and immediately deletes the local file.
+        Returns: (file_id, filename, web_link)
+        """
+        if not os.path.exists(local_path):
+            return None, os.path.basename(local_path), ""
+
+        filename = os.path.basename(local_path)
+        folder_id = self.get_or_create_subfolder(folder_name)
+        file_id, drive_fname, web_link = self.upload_file(local_path, parent_folder_id=folder_id, target_filename=filename)
+
+        # Delete local file from Jetson immediately after verified upload
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+        print(f"[gdrive] Uploaded {filename} -> Google Drive ({folder_name}/) [ID: {file_id}] and deleted local Jetson copy.")
+        return file_id, drive_fname, web_link
+
+    def stream_file(self, file_id):
+        """Streams a file directly from Google Drive chunk by chunk without saving to disk."""
+        headers = self._get_auth_headers()
+        url = f"{self.DRIVE_API_BASE}/files/{file_id}?alt=media"
+        resp = requests.get(url, headers=headers, stream=True, timeout=60)
+        if resp.status_code == 200:
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            return resp.iter_content(chunk_size=65536), content_type
+        return None, None
+
+    def download_file(self, file_id, local_dest_path, timeout=15):
+        """
+        Streams a file from Google Drive to a local temporary destination path.
+        """
+        headers = self._get_auth_headers()
+        url = f"{self.DRIVE_API_BASE}/files/{file_id}?alt=media"
+
+        os.makedirs(os.path.dirname(os.path.abspath(local_dest_path)), exist_ok=True)
+        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"Failed to download file {file_id} from Google Drive: {r.status_code} {r.text}")
+            with open(local_dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+        return local_dest_path
+
+    def extract_fast_clip_and_frame(self, file_id, timestamp_sec, clip_dest_path, frame_dest_path, bbox=None, target_type="target", base_dt=None):
+        """
+        Extracts a 5-second H.264 clip and single frame snapshot directly from Google Drive using HTTP Range seeking.
+        Downloads ONLY ~3-5 MB of video data instead of downloading the entire 340 MB file.
+        """
+        token = self._get_access_token()
+        if not token:
+            return None, None
+
+        start_sec = max(0.0, float(timestamp_sec) - 2.0)
+        relative_offset_sec = max(0.0, float(timestamp_sec) - start_sec)
+        url = f"{self.DRIVE_API_BASE}/files/{file_id}?alt=media"
+        headers_arg = f"Authorization: Bearer {token}\r\n"
+
+        os.makedirs(os.path.dirname(os.path.abspath(clip_dest_path)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(frame_dest_path)), exist_ok=True)
+
+        # 1. Fast Range extraction of 5-second clip via FFmpeg
+        import subprocess
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-headers", headers_arg,
+                "-ss", f"{start_sec:.2f}",
+                "-i", url,
+                "-t", "5.0",
+                "-vcodec", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-preset", "ultrafast",
+                "-loglevel", "error",
+                clip_dest_path,
+            ]
+            subprocess.run(cmd, check=True, timeout=30)
+        except Exception as e:
+            print(f"[gdrive] Fast range clip extraction note: {e}")
+
+        # 2. Extract frame snapshot from the generated clip at the exact relative match offset
+        if os.path.exists(clip_dest_path):
+            try:
+                import cv2
+                import numpy as np
+                from datetime import timedelta
+                cap = cv2.VideoCapture(clip_dest_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if not fps or fps <= 0 or np.isnan(fps):
+                    fps = 30.0
+
+                target_frame_idx = int(round(relative_offset_sec * fps))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_idx)
+                ret, frame = cap.read()
+
+                # Fallback to POS_MSEC seek if POS_FRAMES did not yield a valid frame
+                if not ret or frame is None or frame.size == 0:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, relative_offset_sec * 1000.0)
+                    ret, frame = cap.read()
+
+                cap.release()
+
+                if ret and frame is not None and frame.size > 0:
+                    actual_dt = (base_dt + timedelta(seconds=float(timestamp_sec))) if base_dt else datetime.now()
+                    h, w = frame.shape[:2]
+
+                    # Verify and draw bounding box strictly on the verified match frame
+                    if bbox and len(bbox) == 4:
+                        x1, y1, x2, y2 = bbox
+                        x1 = max(0, min(w - 1, int(x1)))
+                        y1 = max(0, min(h - 1, int(y1)))
+                        x2 = max(0, min(w, int(x2)))
+                        y2 = max(0, min(h, int(y2)))
+                        if x2 > x1 and y2 > y1:
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            print(f"[gdrive-extract] Rendered verified bbox [{x1},{y1},{x2},{y2}] on frame at relative offset {relative_offset_sec:.2f}s (match: {timestamp_sec:.2f}s, clip start: {start_sec:.2f}s)")
+
+                    ts_str = actual_dt.strftime("%d-%m-%Y  %H:%M:%S")
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    scale = 0.60 if w >= 1280 else 0.48
+                    thick = 2 if w >= 1280 else 1
+                    cv2.putText(frame, ts_str, (20, 30), font, scale, (0, 0, 0), thick + 1, cv2.LINE_AA)
+                    cv2.putText(frame, ts_str, (20, 30), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+                    cv2.imwrite(frame_dest_path, frame)
+                    print(f"[gdrive-extract] SUCCESS: Extracted snapshot frame at relative offset {relative_offset_sec:.2f}s (match {timestamp_sec:.2f}s) to {frame_dest_path}")
+                else:
+                    print(f"[gdrive-extract] ERROR: Frame seek/decode failed at relative offset {relative_offset_sec:.2f}s (match {timestamp_sec:.2f}s, start {start_sec:.2f}s). Skipping unverified frame.")
+            except Exception as e:
+                print(f"[gdrive-extract] Frame snapshot extraction error: {e}")
+
+        return (
+            os.path.basename(clip_dest_path) if os.path.exists(clip_dest_path) else None,
+            os.path.basename(frame_dest_path) if os.path.exists(frame_dest_path) else None,
+        )
+
+    def list_all_drive_videos(self, parent_id=None):
+        """
+        Lists all MP4 video files in Google Drive recursively with full pagination.
+        Returns a list of dicts: [{'id': ..., 'name': ..., 'mimeType': ..., 'size': ...}]
+        """
+        headers = self._get_auth_headers()
+        url = f"{self.DRIVE_API_BASE}/files"
+        query = "(mimeType contains 'video/' or name contains '.mp4') and trashed = false"
+        if parent_id and parent_id != "root":
+            query = f"'{parent_id}' in parents and ({query})"
+
+        all_videos = []
+        page_token = None
+        while True:
+            params = {
+                "q": query,
+                "spaces": "drive",
+                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, parents)",
+                "pageSize": 100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=20)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    all_videos.extend(data.get("files", []))
+                    page_token = data.get("nextPageToken")
+                    if not page_token:
+                        break
+                else:
+                    print(f"[gdrive] Failed listing drive files: {resp.status_code} {resp.text}")
+                    break
+            except Exception as e:
+                print(f"[gdrive] Error querying drive files: {e}")
+                break
+        return all_videos
+
+    def get_file_id_by_name(self, filename):
+        """Looks up a Google Drive file ID by its exact filename."""
+        headers = self._get_auth_headers()
+        url = f"{self.DRIVE_API_BASE}/files"
+        query = f"name = '{filename}' and trashed = false"
+        params = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "files(id, name, size)",
+            "pageSize": 1,
+        }
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                files = resp.json().get("files", [])
+                if files:
+                    return files[0]["id"]
+        except Exception as e:
+            print(f"[gdrive] Error searching file by name '{filename}': {e}")
+        return None
+
+    def delete_file(self, file_id):
+        """Deletes a file from Google Drive."""
+        headers = self._get_auth_headers()
+        url = f"{self.DRIVE_API_BASE}/files/{file_id}"
+        resp = requests.delete(url, headers=headers, timeout=15)
+        return resp.status_code in (200, 204)
+
+    def get_or_create_history_root_folder(self):
+        """Finds or creates the top-level 'History' folder in Google Drive."""
+        return self.get_or_create_folder("History", parent_id=self.root_folder_id or "root")
+
+    def get_or_create_query_history_folder(self, query_id, query_name=""):
+        """
+        Creates/retrieves a dedicated folder for a specific query:
+        Google Drive / History / <Query_Name>_<Query_ID> /
+        Example: History / Suspect_Red_Sedan_a1b2c3d4 /
+        """
+        history_root_id = self.get_or_create_history_root_folder()
+        clean_name = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in (query_name or "Target").strip())
+        clean_name = "_".join(filter(None, clean_name.split("_"))) or "Target"
+        folder_name = f"{clean_name}_{query_id}"
+        folder_id = self.get_or_create_folder(folder_name, parent_id=history_root_id)
+        return folder_id, folder_name
+
+    def sync_query_history_to_drive(self, conn, query_id):
+        """
+        Synchronizes all history data for a query to its dedicated Google Drive folder:
+        - Original target image
+        - history_report.json (full match metadata)
+        - history_report.csv (tabular spreadsheet export)
+        Returns: dict with folder_id, folder_name, match_count
+        """
+        if not self.is_configured():
+            return {"ok": False, "error": "Google Drive not configured"}
+
+        try:
+            with conn:
+                q = conn.execute("SELECT * FROM queries WHERE query_id=?", (query_id,)).fetchone()
+                if not q:
+                    return {"ok": False, "error": "Query not found"}
+                q_dict = dict(q)
+                detections = [
+                    dict(r) for r in conn.execute(
+                        "SELECT * FROM detections WHERE query_id=? ORDER BY id ASC", (query_id,)
+                    ).fetchall()
+                ]
+
+            q_name = q_dict.get("query_name") or "Target"
+            folder_id, folder_name = self.get_or_create_query_history_folder(query_id, q_name)
+
+            # Update database with folder ID
+            try:
+                conn.execute("UPDATE queries SET drive_folder_id=? WHERE query_id=?", (folder_id, query_id))
+                conn.commit()
+            except Exception:
+                pass
+
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix=f"gdrive_sync_{query_id}_")
+
+            # 1. Upload original query target image if exists
+            img_path = q_dict.get("image_path")
+            if img_path and os.path.exists(img_path):
+                ext = os.path.splitext(img_path)[1] or ".jpg"
+                target_fname = f"target_image_{query_id}{ext}"
+                try:
+                    self.upload_file(img_path, parent_folder_id=folder_id, target_filename=target_fname)
+                except Exception as e:
+                    print(f"[gdrive-sync] Warning uploading target image: {e}")
+
+            # 2. Generate and upload history_report.json
+            report_data = {
+                "query_id": query_id,
+                "query_name": q_name,
+                "uploaded_at": q_dict.get("uploaded_at"),
+                "stored_status": q_dict.get("stored_status"),
+                "live_status": q_dict.get("live_status"),
+                "target_summary": q_dict.get("target_summary"),
+                "total_matches": len(detections),
+                "synced_at": datetime.now().isoformat(timespec="seconds"),
+                "detections": detections,
+            }
+            json_report_path = os.path.join(temp_dir, "history_report.json")
+            with open(json_report_path, "w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False)
+            self.upload_file(json_report_path, parent_folder_id=folder_id, target_filename="history_report.json", mime_type="application/json")
+
+            # 3. Generate and upload history_report.csv
+            csv_report_path = os.path.join(temp_dir, "history_report.csv")
+            import csv
+            with open(csv_report_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Query ID", "Query Name", "Detection ID", "Event Date", "Event Time",
+                    "Source", "Target Type", "Match Score %", "Video Name", "Video Offset (s)",
+                    "Frame File", "Clip File"
+                ])
+                for d in detections:
+                    score_pct = f"{(d.get('similarity_score', 0) * 100):.1f}%"
+                    writer.writerow([
+                        query_id,
+                        q_name,
+                        d.get("id"),
+                        d.get("detection_date"),
+                        d.get("detection_time"),
+                        d.get("source"),
+                        d.get("target_type"),
+                        score_pct,
+                        d.get("video_name") or "",
+                        d.get("timestamp_sec") or 0.0,
+                        os.path.basename(d.get("frame_path") or ""),
+                        os.path.basename(d.get("clip_path") or ""),
+                    ])
+            self.upload_file(csv_report_path, parent_folder_id=folder_id, target_filename="history_report.csv", mime_type="text/csv")
+
+            # Clean up temp files
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            print(f"[gdrive-sync] Synced history for Query #{query_id} ('{q_name}') -> Google Drive ({folder_name}/) [ID: {folder_id}]")
+            return {
+                "ok": True,
+                "query_id": query_id,
+                "query_name": q_name,
+                "folder_id": folder_id,
+                "folder_name": folder_name,
+                "match_count": len(detections),
+            }
+        except Exception as e:
+            print(f"[gdrive-sync] Error syncing query #{query_id} to Google Drive: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def sync_all_history_to_drive(self, conn):
+        """Syncs all queries and their match history into Google Drive / History /."""
+        with conn:
+            q_rows = conn.execute("SELECT query_id FROM queries").fetchall()
+        results = []
+        for r in q_rows:
+            res = self.sync_query_history_to_drive(conn, r["query_id"])
+            results.append(res)
+        return {
+            "ok": True,
+            "synced_count": sum(1 for r in results if r.get("ok")),
+            "total_queries": len(q_rows),
+            "details": results,
+        }
+
+    def sync_all_drive_recordings_to_db(self, conn):
+        """
+        Scans all CCTV video recordings across all date/hour folders in Google Drive,
+        registers any missing recordings in the SQLite recordings table, and updates
+        Google Drive file IDs for full historical search coverage.
+        """
+        if not self.is_configured():
+            return {"ok": False, "error": "Google Drive not configured"}
+
+        import uuid
+        from datetime import timedelta
+        from .config import get_video_start_time
+
+        try:
+            drive_videos = self.list_all_drive_videos()
+            rec_videos = [
+                v for v in drive_videos
+                if v.get("name", "").startswith("REC_") and v.get("name", "").endswith(".mp4")
+            ]
+
+            with conn:
+                existing_rows = {
+                    r["filename"]: dict(r)
+                    for r in conn.execute("SELECT * FROM recordings").fetchall()
+                }
+
+                new_count = 0
+                updated_count = 0
+                distinct_dates = set()
+
+                for v in rec_videos:
+                    fname = v.get("name", "")
+                    file_id = v.get("id", "")
+                    drive_url = f"https://drive.google.com/file/d/{file_id}/view"
+
+                    # Calculate recording start time
+                    start_dt = get_video_start_time(fname)
+                    end_dt = start_dt + timedelta(seconds=300)
+                    start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    distinct_dates.add(start_dt.strftime("%Y-%m-%d"))
+
+                    if fname not in existing_rows:
+                        rec_id = str(uuid.uuid4())[:12]
+                        conn.execute(
+                            """
+                            INSERT INTO recordings (
+                                recording_id, start_time, end_time, filename, local_cache_path,
+                                upload_status, google_drive_file_id, google_drive_path,
+                                index_status, retry_count
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                rec_id, start_str, end_str, fname, "",
+                                "uploaded", file_id, drive_url,
+                                "pending", 0,
+                            ),
+                        )
+                        new_count += 1
+                    else:
+                        existing = existing_rows[fname]
+                        if not existing.get("google_drive_file_id") or existing.get("google_drive_file_id") != file_id:
+                            conn.execute(
+                                """
+                                UPDATE recordings
+                                SET google_drive_file_id=?, google_drive_path=?, upload_status='uploaded'
+                                WHERE filename=?
+                                """,
+                                (file_id, drive_url, fname),
+                            )
+                            updated_count += 1
+
+                conn.commit()
+
+            print(
+                f"[gdrive-sync] Registered {new_count} new cloud recordings, updated {updated_count} IDs "
+                f"from {len(rec_videos)} Google Drive files across {len(distinct_dates)} days."
+            )
+            return {
+                "ok": True,
+                "total_drive_recordings": len(rec_videos),
+                "new_recordings_registered": new_count,
+                "updated_recordings": updated_count,
+                "dates": sorted(list(distinct_dates)),
+            }
+        except Exception as e:
+            print(f"[gdrive-sync] Error synchronizing Google Drive recordings to DB: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def upload_pending_buffer_recordings(self, conn):
+        """
+        Scans all pending recordings from the database and files in video_buffer,
+        and uploads each pending recording to Google Drive.
+        """
+        if not self.is_configured():
+            print("[gdrive-upload] ERROR: Google Drive is not configured.")
+            return {"ok": False, "error": "Google Drive not configured"}
+
+        from .config import VIDEO_BUFFER_DIR, get_video_start_time, RECORDING_SEGMENT_SECONDS
+        import uuid
+        from datetime import timedelta
+
+        # 1. Fetch pending rows from DB
+        pending_rows = conn.execute(
+            "SELECT * FROM recordings WHERE upload_status != 'uploaded' ORDER BY start_time ASC"
+        ).fetchall()
+
+        # 2. Also scan video_buffer for any mp4 files on disk
+        disk_files = {}
+        if os.path.exists(VIDEO_BUFFER_DIR):
+            for f in os.listdir(VIDEO_BUFFER_DIR):
+                if f.endswith(".mp4") and not f.endswith((".tmp", ".part")) and not f.startswith("_raw_"):
+                    fp = os.path.join(VIDEO_BUFFER_DIR, f)
+                    if os.path.exists(fp) and os.path.getsize(fp) > 1024:
+                        disk_files[f] = fp
+
+        targets_to_upload = []
+        seen_filenames = set()
+
+        for r in pending_rows:
+            fn = r["filename"]
+            lp = r["local_cache_path"]
+            if not lp or not os.path.exists(lp):
+                lp = disk_files.get(fn)
+            if lp and os.path.exists(lp) and os.path.getsize(lp) > 1024:
+                targets_to_upload.append((fn, lp, r["recording_id"]))
+                seen_filenames.add(fn)
+
+        for fn, lp in disk_files.items():
+            if fn not in seen_filenames:
+                targets_to_upload.append((fn, lp, None))
+                seen_filenames.add(fn)
+
+        print(f"[gdrive-upload] Found {len(targets_to_upload)} video recordings to upload to Google Drive.")
+        uploaded_count = 0
+
+        for idx, (filename, full_path, rec_id) in enumerate(targets_to_upload, 1):
+            try:
+                start_dt = get_video_start_time(full_path)
+                size_mb = os.path.getsize(full_path) / (1024 * 1024)
+                print(f"[gdrive-upload] [{idx}/{len(targets_to_upload)}] Uploading {filename} ({size_mb:.1f} MB)...")
+                target_folder_id, hierarchy_path = self.get_or_create_folder_hierarchy(start_dt)
+                file_id, drive_fname, web_link = self.upload_file(full_path, target_folder_id, target_filename=filename)
+
+                if file_id:
+                    drive_full_path = f"{hierarchy_path}/{drive_fname}"
+                    end_dt = start_dt + timedelta(seconds=RECORDING_SEGMENT_SECONDS)
+                    if not rec_id:
+                        rec_id = str(uuid.uuid4())[:12]
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO recordings (
+                                recording_id, start_time, end_time, filename, local_cache_path,
+                                upload_status, google_drive_file_id, google_drive_path,
+                                index_status, retry_count
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                rec_id, start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                end_dt.strftime("%Y-%m-%d %H:%M:%S"), filename, "",
+                                "uploaded", file_id, drive_full_path, "pending", 0,
+                            )
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE recordings
+                            SET upload_status='uploaded', google_drive_file_id=?, google_drive_path=?, local_cache_path=''
+                            WHERE recording_id=? OR filename=?
+                            """,
+                            (file_id, drive_full_path, rec_id, filename)
+                        )
+                    conn.commit()
+                    uploaded_count += 1
+                    # Delete local video from buffer immediately after verified upload
+                    if os.path.exists(full_path):
+                        try:
+                            os.remove(full_path)
+                            print(f"[gdrive-upload] Deleted local video file after cloud upload: {filename}")
+                        except OSError as rm_err:
+                            print(f"[gdrive-upload] Note deleting local file {filename}: {rm_err}")
+                    print(f"[gdrive-upload] SUCCESS [{idx}/{len(targets_to_upload)}]: {filename} -> Drive ID: {file_id}")
+            except Exception as e:
+                print(f"[gdrive-upload] ERROR uploading {filename}: {e}")
+
+        print(f"[gdrive-upload] Batch complete: {uploaded_count}/{len(targets_to_upload)} files successfully uploaded to Google Drive.")
+        return {"ok": True, "uploaded_count": uploaded_count, "total": len(targets_to_upload)}
+
+
+# Global singleton instance
+gdrive_storage = GoogleDriveStorage()
+
+

@@ -1,0 +1,525 @@
+"""
+Segmented video recorder and clip generator for Jetson Nano AI Vision Search.
+"""
+import os
+import shutil
+import subprocess
+import threading
+import time
+from collections import deque
+from datetime import datetime, timedelta
+import cv2
+import numpy as np
+
+from .config import (
+    LIVE_RECORDINGS_DIR,
+    RECORDING_SEGMENT_SECONDS,
+    FRAMES_DIR,
+    CLIPS_DIR,
+)
+from .gdrive import gdrive_storage
+
+
+def _cleanup_old_media(directory, max_files=400):
+    """Keeps the directory within max_files limit by removing oldest files."""
+    try:
+        if not os.path.exists(directory):
+            return
+        files = [
+            os.path.join(directory, f)
+            for f in os.listdir(directory)
+            if not f.startswith(".") and not f.startswith("_raw_")
+        ]
+        if len(files) > max_files:
+            files.sort(key=lambda p: os.path.getmtime(p))
+            for old_p in files[:-max_files]:
+                try:
+                    os.remove(old_p)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def upload_to_cloud(local_path, folder_name="frames"):
+    """
+    Schedules asynchronous background upload to Google Drive under the specified
+    folder ('frames' or 'clips') while preserving the local copy on Jetson disk
+    for instant, zero-latency Web UI playback.
+    """
+    if not local_path or not os.path.exists(local_path):
+        return os.path.basename(local_path) if local_path else ""
+
+    filename = os.path.basename(local_path)
+
+    if gdrive_storage.is_configured():
+        def _bg_upload():
+            try:
+                folder_id = gdrive_storage.get_or_create_subfolder(folder_name)
+                gdrive_storage.upload_file(
+                    local_path, parent_folder_id=folder_id, target_filename=filename
+                )
+                print(f"[recorder] Background uploaded {filename} to Google Drive ({folder_name}/).")
+            except Exception as e:
+                print(f"[recorder] Cloud upload note for {filename}: {e}")
+
+        threading.Thread(target=_bg_upload, daemon=True, name=f"upload-{filename}").start()
+
+    return filename
+
+
+def _mux_to_h264(raw_path, final_path):
+    """Re-encodes video clip to browser-standard H.264 (yuv420p + faststart) for instant Web UI playback."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", raw_path,
+                "-vcodec", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-preset", "ultrafast",
+                "-f", "mp4",
+                final_path, "-loglevel", "error"
+            ],
+            check=True,
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"[warn] ffmpeg mux failed ({e}), using raw clip fallback")
+        shutil.copy(raw_path, final_path)
+    finally:
+        if os.path.exists(raw_path):
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+
+
+def save_matched_frame(frame, bbox, detection_id, event_dt=None):
+    """
+    Saves annotated image frame with bounding box and burned-in timestamp overlay,
+    retains local disk copy for instant UI rendering, and queues Google Drive backup.
+    """
+    dt = event_dt or datetime.now()
+    dt_tag = dt.strftime("%Y%m%d_%H%M%S")
+    filename = f"frame_{dt_tag}_{detection_id}.jpg"
+    path = os.path.join(FRAMES_DIR, filename)
+    annotated = frame.copy()
+    if bbox:
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    add_timestamp_overlay(annotated, dt=dt)
+    cv2.imwrite(path, annotated)
+    _cleanup_old_media(FRAMES_DIR, max_files=400)
+    upload_to_cloud(path, folder_name="frames")
+    return filename
+
+
+def save_clip_from_stored_video(video_path, timestamp_sec, bbox, target_type, detection_id, base_dt=None):
+    """
+    Cuts a short clip (-2s to +3s) around the match timestamp with continuous timestamp overlay,
+    retains local disk copy for instant UI playback, and queues Google Drive backup.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    start_sec = max(0, timestamp_sec - 2.0)
+    end_sec = min(total_frames / fps, timestamp_sec + 3.0)
+    start_frame, end_frame = int(start_sec * fps), int(end_sec * fps)
+
+    if base_dt is None:
+        from .config import get_video_start_time
+        base_dt = get_video_start_time(video_path)
+
+    match_dt = base_dt + timedelta(seconds=timestamp_sec)
+    dt_tag = match_dt.strftime("%Y%m%d_%H%M%S")
+
+    raw_path = os.path.join(CLIPS_DIR, f"_raw_{dt_tag}_{detection_id}.mp4")
+    final_filename = f"clip_{dt_tag}_{detection_id}.mp4"
+    final_path = os.path.join(CLIPS_DIR, final_filename)
+
+    writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    cur = start_frame
+    while cap.isOpened() and cur <= end_frame:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        clip_frame = frame.copy()
+        frame_time_offset = cur / fps
+        frame_dt = base_dt + timedelta(seconds=frame_time_offset)
+        add_timestamp_overlay(clip_frame, dt=frame_dt)
+
+        if bbox and abs(cur - int(timestamp_sec * fps)) < fps:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(clip_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(clip_frame, f"MATCHED {target_type.upper()}", (x1, max(y1 - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        writer.write(clip_frame)
+        cur += 1
+    cap.release()
+    writer.release()
+
+    _mux_to_h264(raw_path, final_path)
+    _cleanup_old_media(CLIPS_DIR, max_files=200)
+    upload_to_cloud(final_path, folder_name="clips")
+    return final_filename
+
+
+def add_timestamp_overlay(frame, dt=None):
+    """
+    Burns a crisp, professional, high-visibility CCTV-grade date & timestamp
+    overlay badge directly onto the video frame in 'DD-MM-YYYY  HH:MM:SS' format.
+    Uses a semi-transparent high-contrast backdrop for perfect legibility across
+    all lighting conditions (sunlight, headlights, dark night vision).
+    """
+    if frame is None or frame.size == 0:
+        return frame
+
+    ts_str = (dt or datetime.now()).strftime("%d-%m-%Y  %H:%M:%S")
+    h, w = frame.shape[:2]
+
+    # Proportional scaling according to resolution
+    if w >= 1920:
+        font_scale = 0.70
+        thickness = 2
+        pad_x, pad_y = 14, 10
+        margin_x, margin_y = 16, 16
+    elif w >= 1280:
+        font_scale = 0.60
+        thickness = 2
+        pad_x, pad_y = 12, 8
+        margin_x, margin_y = 14, 14
+    else:
+        font_scale = 0.48
+        thickness = 1
+        pad_x, pad_y = 10, 6
+        margin_x, margin_y = 10, 10
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(ts_str, font, font_scale, thickness)
+
+    # Coordinates for badge rectangle
+    x1 = margin_x
+    y1 = margin_y
+    x2 = x1 + tw + (pad_x * 2)
+    y2 = y1 + th + (pad_y * 2)
+
+    # Ensure coordinates stay within frame bounds
+    x2 = min(w - 2, x2)
+    y2 = min(h - 2, y2)
+
+    # Semi-transparent dark background pill for 100% contrast
+    sub_img = frame[y1:y2, x1:x2]
+    if sub_img.shape[0] > 0 and sub_img.shape[1] > 0:
+        dark_rect = np.zeros_like(sub_img, dtype=np.uint8)
+        # 75% dark blend
+        blended = cv2.addWeighted(dark_rect, 0.72, sub_img, 0.28, 0)
+        frame[y1:y2, x1:x2] = blended
+
+        # Subtle dark border
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (40, 40, 40), 1, cv2.LINE_AA)
+
+    # Text baseline position
+    text_x = x1 + pad_x
+    text_y = y1 + pad_y + th
+
+    # Text drop shadow / outline
+    cv2.putText(
+        frame, ts_str, (text_x, text_y), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA
+    )
+    # Bright crisp white text
+    cv2.putText(
+        frame, ts_str, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA
+    )
+    return frame
+
+
+def save_clip_from_live_buffer(frame_buffer, detection_id, fps=10, event_dt=None):
+    """
+    Saves a short clip from the in-memory ring buffer of live frames with continuous timestamp overlay,
+    retains local disk copy for instant UI playback, and queues Google Drive backup.
+    """
+    if not frame_buffer:
+        return None
+    dt = event_dt or datetime.now()
+    dt_tag = dt.strftime("%Y%m%d_%H%M%S")
+    h, w = frame_buffer[0].shape[:2]
+    raw_path = os.path.join(CLIPS_DIR, f"_raw_{dt_tag}_{detection_id}.mp4")
+    final_filename = f"clip_{dt_tag}_{detection_id}.mp4"
+    final_path = os.path.join(CLIPS_DIR, final_filename)
+    writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    num_frames = len(frame_buffer)
+    for i, f in enumerate(frame_buffer):
+        clip_frame = f.copy()
+        frame_offset_sec = (num_frames - 1 - i) / fps
+        frame_dt = dt - timedelta(seconds=frame_offset_sec)
+        add_timestamp_overlay(clip_frame, dt=frame_dt)
+        writer.write(clip_frame)
+    writer.release()
+    _mux_to_h264(raw_path, final_path)
+    _cleanup_old_media(CLIPS_DIR, max_files=200)
+    upload_to_cloud(final_path, folder_name="clips")
+    return final_filename
+
+
+def is_valid_mp4(file_path: str, min_size_bytes: int = 1024) -> bool:
+    """
+    Checks whether an MP4 file exists, has valid non-zero size,
+    and can be opened and parsed by OpenCV/ffmpeg with a valid moov atom.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return False
+    try:
+        if os.path.getsize(file_path) < min_size_bytes:
+            return False
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return bool(ret and frame is not None and frame.size > 0)
+    except Exception:
+        return False
+
+
+import queue
+
+
+class SegmentedRecorder:
+    """
+    Continuously records live camera footage into 5-minute segmented MP4 files
+    via a dedicated asynchronous background worker thread to ensure the camera capture
+    thread runs at full sensor framerate without I/O blocking.
+
+    Safe recording lifecycle:
+      1. Write active segment to temporary: REC_YYYYMMDD_HHMMSS.mp4.part
+      2. On 5-minute rotation or close():
+         - VideoWriter.release()
+         - Flush and verify MP4 integrity with is_valid_mp4()
+         - Atomically rename REC_YYYYMMDD_HHMMSS.mp4.part -> REC_YYYYMMDD_HHMMSS.mp4
+         - ONLY then invoke on_segment_closed callback with finalized .mp4 path
+    """
+
+    def __init__(
+        self,
+        output_dir=LIVE_RECORDINGS_DIR,
+        segment_seconds=RECORDING_SEGMENT_SECONDS,
+        on_segment_closed=None,
+    ):
+        self.output_dir = output_dir
+        self.segment_seconds = segment_seconds
+        self.on_segment_closed = on_segment_closed
+        self.lock = threading.Lock()
+        self.writer = None
+        self.start_time = None
+        self.current_part_path = None
+        self.final_target_path = None
+        self.fps = 30
+        self.queue = queue.Queue(maxsize=45)
+        self.running = True
+        self._frame_times = deque(maxlen=60)
+        self._stats_lock = threading.Lock()
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._recover_leftover_parts()
+        self.worker_thread = threading.Thread(
+            target=self._record_worker, daemon=True, name="recorder-worker"
+        )
+        self.worker_thread.start()
+
+    def _recover_leftover_parts(self):
+        """
+        Scans for any orphan .tmp or .part files from previous unclean shutdowns or power cuts.
+        Attempts to finalize if valid, or safely preserves unrecoverable fragments.
+        """
+        if not os.path.exists(self.output_dir):
+            return
+        try:
+            for fname in os.listdir(self.output_dir):
+                if fname.startswith("REC_") and (fname.endswith(".mp4.tmp") or fname.endswith(".mp4.part")):
+                    part_path = os.path.join(self.output_dir, fname)
+                    final_path = part_path.replace(".mp4.tmp", ".mp4").replace(".mp4.part", ".mp4")
+                    if is_valid_mp4(part_path):
+                        try:
+                            os.replace(part_path, final_path)
+                            print(f"[SegmentedRecorder] Recovered valid unfinalized recording: {os.path.basename(final_path)}")
+                            if self.on_segment_closed:
+                                self.on_segment_closed(final_path)
+                        except OSError as e:
+                            print(f"[SegmentedRecorder] Failed renaming recovered file {part_path}: {e}")
+                    else:
+                        print(f"[SegmentedRecorder] Preserved incomplete recording fragment: {fname}")
+        except Exception as e:
+            print(f"[SegmentedRecorder] Error checking leftover parts: {e}")
+
+    def set_fps(self, fps):
+        self.fps = max(1, int(fps))
+
+    def write(self, frame):
+        """Called for every captured frame on the camera thread (non-blocking)."""
+        if frame is None or not self.running:
+            return
+        try:
+            self.queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def _record_worker(self):
+        """Asynchronous disk writer worker."""
+        while self.running or not self.queue.empty():
+            try:
+                item = self.queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                # Sentinel to stop
+                break
+
+            frame = item
+            closed_path = None
+            with self.lock:
+                now = time.time()
+                need_new = (
+                    self.writer is None
+                    or self.start_time is None
+                    or (now - self.start_time >= self.segment_seconds)
+                )
+                if need_new:
+                    closed_path = self._rotate_locked(frame)
+                if self.writer is not None:
+                    rec_frame = frame.copy()
+                    add_timestamp_overlay(rec_frame)
+                    self.writer.write(rec_frame)
+                    with self._stats_lock:
+                        self._frame_times.append(time.time())
+
+            if closed_path and self.on_segment_closed:
+                try:
+                    self.on_segment_closed(closed_path)
+                except Exception as e:
+                    print(f"[SegmentedRecorder] Error in on_segment_closed callback: {e}")
+
+        # Final cleanup
+        with self.lock:
+            final_closed = self._close_locked()
+        if final_closed and self.on_segment_closed:
+            try:
+                self.on_segment_closed(final_closed)
+            except Exception as e:
+                print(f"[SegmentedRecorder] Error in on_segment_closed final callback: {e}")
+
+    def _rotate_locked(self, frame):
+        closed_path = self._close_locked()
+        h, w = frame.shape[:2]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.final_target_path = os.path.join(self.output_dir, f"REC_{ts}.mp4")
+        self.current_part_path = os.path.join(self.output_dir, f"REC_{ts}.mp4.tmp")
+
+        self.writer = cv2.VideoWriter(
+            self.current_part_path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (w, h)
+        )
+        if not self.writer.isOpened():
+            print(f"[SegmentedRecorder] ERROR: VideoWriter could not open {self.current_part_path}")
+            self.writer = None
+            self.current_part_path = None
+            self.final_target_path = None
+        else:
+            self.start_time = time.time()
+            print(f"[SegmentedRecorder] STARTED: {os.path.basename(self.current_part_path)} @ {self.fps} FPS")
+        return closed_path
+
+    def _close_locked(self):
+        closed = None
+        if self.writer is not None:
+            part_path = self.current_part_path
+            final_path = self.final_target_path
+            if part_path:
+                print(f"[SegmentedRecorder] FINALIZING: {os.path.basename(part_path)}")
+            self.writer.release()
+            self.writer = None
+            print("[SegmentedRecorder] VideoWriter released")
+
+            if part_path and os.path.exists(part_path):
+                if is_valid_mp4(part_path):
+                    try:
+                        print(f"[SegmentedRecorder] validated recording: {os.path.basename(part_path)}")
+                        os.replace(part_path, final_path)
+                        print(f"[SegmentedRecorder] finalized: {os.path.basename(final_path)}")
+                        closed = final_path
+                    except OSError as e:
+                        print(f"[SegmentedRecorder] Error renaming {part_path} to {final_path}: {e}")
+                else:
+                    print(f"[SegmentedRecorder] Warning: discarded incomplete/empty recording: {part_path}")
+                    try:
+                        if os.path.getsize(part_path) < 1024:
+                            os.remove(part_path)
+                    except OSError:
+                        pass
+
+        self.writer = None
+        self.start_time = None
+        self.current_part_path = None
+        self.final_target_path = None
+        return closed
+
+    def close(self):
+        """Closes current open segment cleanly."""
+        self.running = False
+        try:
+            while self.queue.full():
+                try:
+                    self.queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=5.0)
+
+    def current_recording_path(self):
+        with self.lock:
+            return self.final_target_path or self.current_part_path
+
+    def recording_start_time(self):
+        with self.lock:
+            return self.start_time
+
+    def is_recording(self):
+        with self.lock:
+            return self.writer is not None
+
+    def get_encoded_fps(self):
+        with self._stats_lock:
+            if len(self._frame_times) < 2:
+                return 0.0
+            dt = self._frame_times[-1] - self._frame_times[0]
+            if dt > 0:
+                return round((len(self._frame_times) - 1) / dt, 1)
+            return 0.0
+
+    def get_performance_stats(self):
+        return {
+            "encoded_fps": self.get_encoded_fps(),
+            "configured_fps": self.fps,
+            "is_recording": self.is_recording(),
+            "queue_size": self.queue.qsize(),
+            "queue_maxsize": self.queue.maxsize,
+            "current_file": (
+                os.path.basename(self.current_recording_path())
+                if self.current_recording_path() else None
+            ),
+        }
+
